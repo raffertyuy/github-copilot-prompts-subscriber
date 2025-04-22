@@ -2,14 +2,24 @@ name: Pull Copilot Prompts
 
 on:
   schedule:
-    - cron: '0 0 * * 1'  # Run every Monday at 12 AM
-  workflow_dispatch:  # Allow manual triggering
+    - cron: '0 12 * * 1'  # Every Monday at 12:00 PM UTC
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: 'Force sync even if no changes'
+        required: false
+        default: false
+        type: boolean
 
 env:
-  BRANCH_NAME: update/copilot-prompts
-  COMMIT_MESSAGE: 'Update Copilot prompts from publisher repository'
-  PR_TITLE: 'Update Copilot prompts'
-  PR_BODY: 'This PR updates the Copilot prompts from the publisher repository.'
+  BRANCH_NAME: update/copilot-prompts-${{ github.run_number }}
+  COMMIT_MESSAGE: 'Update Copilot prompts from publisher repository [skip ci]'
+  PR_TITLE: '📚 Update Copilot prompts from publisher'
+  PR_BODY: |
+    This PR updates Copilot prompts from the publisher repository.
+    - Source: ${{ vars.PUBLISHER_GIT_URL }}
+    - Updated: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    ${{ inputs.force_sync && '- Note: This is a forced sync' || '' }}
 
 jobs:
   sync-prompts:
@@ -17,72 +27,58 @@ jobs:
     steps:
       - name: Checkout destination repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT }}  # Use PAT instead of GITHUB_TOKEN
 
-      - name: Clone source repository
+      - name: Clone and process source repository
+        id: sync
         run: |
-          git clone https://${{ secrets.PAT }}@${{ vars.PUBLISHER_GIT_URL }} source-repo
-
-      - name: Check for changes
-        id: check-changes
-        run: |
-          # Create .github directory if it doesn't exist
-          mkdir -p .github
-
-          # Initialize changes flag
-          changes_detected=false
-
-          # Copy and compare files
-          cd source-repo
-          for file in $(find .github -name "*.md" -type f 2>/dev/null); do
-            target_file="../$file"
-            target_dir=$(dirname "../$file")
-            
-            # Create target directory if it doesn't exist
-            mkdir -p "$target_dir"
-            
-            if [ ! -f "$target_file" ] || ! cmp -s "$file" "$target_file"; then
-              changes_detected=true
-              break
-            fi
+          # Prepare repository URL with PAT
+          REPO_URL="${{ vars.PUBLISHER_GIT_URL }}"
+          REPO_URL=$(echo "$REPO_URL" | sed -E "s#^(https?://)?#https://${{ secrets.PAT }}@#")
+          
+          # Clone source repository with retry logic
+          for i in {1..3}; do
+            git clone --depth 1 "$REPO_URL" source-repo && break
+            rm -rf source-repo
+            [ $i -eq 3 ] && { echo "Failed to clone repository after 3 attempts"; exit 1; }
+            sleep 5
           done
-          cd ..
 
-          # Set output
+          # Process markdown files
+          mkdir -p .github
+          changes_detected=false
+          
+          if [ -d "source-repo/.github" ]; then
+            cd source-repo
+            for file in $(find .github -name "*.md" -type f); do
+              mkdir -p "../$(dirname "$file")"
+              if [ ! -f "../$file" ] || ! cmp -s "$file" "../$file"; then
+                cp --parents "$file" ../
+                changes_detected=true
+                echo "Changed or added: $file"
+              fi
+            done
+            cd ..
+          fi
+          
+          rm -rf source-repo
+          if [ "${{ inputs.force_sync }}" == "true" ]; then
+            changes_detected=true
+            echo "Force sync enabled - will create PR regardless of changes"
+          fi
           echo "changes_detected=$changes_detected" >> $GITHUB_OUTPUT
 
-      - name: No changes detected
-        if: steps.check-changes.outputs.changes_detected != 'true'
-        run: echo "No changes detected in Copilot prompts. Workflow completed."
-
-      - name: Create branch and copy files
-        if: steps.check-changes.outputs.changes_detected == 'true'
-        run: |
-          # Create and checkout new branch
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
-          git checkout -b ${{ env.BRANCH_NAME }}
-
-          # Copy all .md files from source
-          cd source-repo
-          find .github -name "*.md" -type f -exec cp --parents {} ../ \;
-          cd ..
-
-          # Stage, commit and push changes
-          git add .github/
-          git commit -m "${{ env.COMMIT_MESSAGE }}"
-          git push origin ${{ env.BRANCH_NAME }}
-
-      - name: Create Pull Request
-        if: steps.check-changes.outputs.changes_detected == 'true'
-        uses: actions/github-script@v7
+      - name: Create PR
+        if: steps.sync.outputs.changes_detected == 'true'
+        uses: peter-evans/create-pull-request@v7
         with:
-          script: |
-            const { repo, owner } = context.repo;
-            await github.rest.pulls.create({
-              owner,
-              repo,
-              title: process.env.PR_TITLE,
-              body: process.env.PR_BODY,
-              head: process.env.BRANCH_NAME,
-              base: 'main'
-            });
+          token: ${{ secrets.PAT }}  # Use PAT instead of GITHUB_TOKEN
+          commit-message: ${{ env.COMMIT_MESSAGE }}${{ inputs.force_sync && ' (forced sync)' || '' }}
+          branch: ${{ env.BRANCH_NAME }}
+          base: main
+          add-paths: |
+            .github
+          title: ${{ env.PR_TITLE }}${{ inputs.force_sync && ' (forced)' || '' }}
+          body: ${{ env.PR_BODY }}
+          delete-branch: true

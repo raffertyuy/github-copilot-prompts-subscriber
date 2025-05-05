@@ -1,0 +1,1 @@
+Validate the code generated according to the devkit instructions found in http://localhost:3000.
